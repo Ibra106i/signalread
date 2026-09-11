@@ -8,10 +8,9 @@ from __future__ import annotations
 import json
 import logging
 import struct
-import tempfile
 import time
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,7 @@ from .engine import TTSEngine, SynthResult
 logger = logging.getLogger(__name__)
 
 _SILENCE_DURATION_S = 0.5
-_SILENCE_SAMPLE_RATE = 24000
+_DEFAULT_SAMPLE_RATE = 24000
 
 
 @dataclass
@@ -46,7 +45,7 @@ class PipelineResult:
 
 
 def _make_silence(duration_s: float, sample_rate: int) -> np.ndarray:
-    """Generate a silent audio array."""
+    """Generate a silent audio array at the given sample rate."""
     n_samples = int(duration_s * sample_rate)
     return np.zeros(n_samples, dtype=np.float32)
 
@@ -69,7 +68,6 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     audio_int16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
     raw = audio_int16.tobytes()
 
-    # Build WAV header
     data_size = len(raw)
     header = struct.pack(
         "<4sI4s4sIHHIIHH4sI",
@@ -134,62 +132,55 @@ def run_pipeline(
 
     logger.info("Body blocks: %d / %d total", len(body_blocks), len(blocks))
 
-    # --- Chunk ---
-    chunks = chunk_blocks(body_blocks)
-    logger.info("Chunks: %d", len(chunks))
-
     # --- Detect chapters ---
     chapters = detect_chapters(body_blocks)
     logger.info("Chapters detected: %d", len(chapters))
     for ch in chapters:
         logger.info("  %s: blocks %d–%d", ch.id, ch.block_start, ch.block_end - 1)
 
-    # --- Build chunk-to-chapter mapping ---
-    chunk_chapters: dict[int, str] = {}
-    for ch in chapters:
-        for ci, chunk in enumerate(chunks):
-            # A chunk belongs to a chapter if any of its source blocks fall in the chapter range
-            for blockIdx in chunk.source_block_indices:
-                if ch.block_start <= blockIdx < ch.block_end:
-                    chunk_chapters[ci] = ch.id
-                    break
-            if ci not in chunk_chapters:
-                chunk_chapters[ci] = ch.id  # fallback
-
-    # --- Synthesize per chapter ---
+    # --- Synthesize per chapter, chunking within each chapter ---
     manifest: list[ManifestEntry] = []
-    total_chunks = len(chunks)
+    total_chunks = 0
     successful = 0
     failed = 0
+    chapters_done = 0
 
     for ch in chapters:
-        ch_chunks = [
-            (ci, chunk) for ci, chunk in enumerate(chunks)
-            if chunk_chapters.get(ci) == ch.id
-        ]
+        chapter_body = body_blocks[ch.block_start:ch.block_end]
+        if not chapter_body:
+            continue
+
+        ch_chunks = chunk_blocks(chapter_body)
         if not ch_chunks:
             continue
 
+        total_chunks += len(ch_chunks)
+        chapters_done += 1
         logger.info("Synthesizing chapter %s (%d chunks)...", ch.id, len(ch_chunks))
+
         chapter_wav_dir = output_dir / "_tmp_wav"
         chapter_wav_dir.mkdir(exist_ok=True)
         chapter_wav_files: list[Path] = []
         chapter_manifest: list[ManifestEntry] = []
         cumulative_time = 0.0
+        chapter_sample_rate: int | None = None
 
-        for ci, chunk in ch_chunks:
+        for ci, chunk in enumerate(ch_chunks):
             t0 = time.monotonic()
             result = engine.synthesize(chunk.text)
             dt = time.monotonic() - t0
 
             if result is not None:
-                # Write chunk to temp WAV
+                sr = result.sample_rate
+                if chapter_sample_rate is None:
+                    chapter_sample_rate = sr
+
                 chunk_wav = chapter_wav_dir / f"chunk_{ci:05d}.wav"
-                audio_bytes = _audio_to_wav_bytes(result.audio, result.sample_rate)
+                audio_bytes = _audio_to_wav_bytes(result.audio, sr)
                 chunk_wav.write_bytes(audio_bytes)
                 chapter_wav_files.append(chunk_wav)
 
-                chunk_duration = len(result.audio) / result.sample_rate
+                chunk_duration = len(result.audio) / sr
                 chapter_manifest.append(ManifestEntry(
                     chunk_index=ci,
                     start_time=round(cumulative_time, 3),
@@ -201,10 +192,11 @@ def run_pipeline(
                 successful += 1
                 logger.debug("  chunk %d: %.2fs audio (%.1fs synth time)", ci, chunk_duration, dt)
             else:
-                # Failed — insert silence placeholder
-                silence = _make_silence(_SILENCE_DURATION_S, _SILENCE_SAMPLE_RATE)
+                # Use the chapter's detected sample rate, or default
+                sr = chapter_sample_rate or _DEFAULT_SAMPLE_RATE
+                silence = _make_silence(_SILENCE_DURATION_S, sr)
                 chunk_wav = chapter_wav_dir / f"chunk_{ci:05d}.wav"
-                audio_bytes = _audio_to_wav_bytes(silence, _SILENCE_SAMPLE_RATE)
+                audio_bytes = _audio_to_wav_bytes(silence, sr)
                 chunk_wav.write_bytes(audio_bytes)
                 chapter_wav_files.append(chunk_wav)
 
@@ -222,17 +214,19 @@ def run_pipeline(
                     ci, _SILENCE_DURATION_S, chunk.text[:80],
                 )
 
-        # --- Concatenate chapter audio ---
+        # --- Concatenate chapter audio at the correct sample rate ---
         if chapter_wav_files:
+            sr = chapter_sample_rate or _DEFAULT_SAMPLE_RATE
             chapter_audio_path = output_dir / f"{ch.id}.wav"
-            _concat_wavs(chapter_wav_files, chapter_audio_path, _SILENCE_SAMPLE_RATE)
-            logger.info("  -> %s (%.1fs)", chapter_audio_path.name, cumulative_time)
+            _concat_wavs(chapter_wav_files, chapter_audio_path, sr)
+            logger.info("  -> %s (%.1fs, %dHz)", chapter_audio_path.name, cumulative_time, sr)
             manifest.extend(chapter_manifest)
 
         # --- Cleanup temp WAVs ---
         for wf in chapter_wav_files:
             wf.unlink(missing_ok=True)
-        chapter_wav_dir.rmdir()
+        if chapter_wav_dir.exists():
+            chapter_wav_dir.rmdir()
 
     # --- Write manifest ---
     manifest_path = output_dir / "manifest.json"
@@ -251,7 +245,7 @@ def run_pipeline(
     logger.info("Manifest: %s (%d entries)", manifest_path.name, len(manifest_data))
 
     return PipelineResult(
-        chapters_completed=len([ch for ch in chapters if any(chunk_chapters.get(ci) == ch.id for ci, _ in enumerate(chunks))]),
+        chapters_completed=chapters_done,
         total_chunks=total_chunks,
         successful_chunks=successful,
         failed_chunks=failed,

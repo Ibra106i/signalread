@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Heuristic fast-path: classify very short ambiguous blocks without LLM
 # ---------------------------------------------------------------------------
-_TRAILING_NUM_RE = re.compile(r"[^\d]\d+$")
+_TRAILING_NUM_RE = re.compile(r"[^\d][\d.]+$")
+_SENTENCE_PUNCT_RE = re.compile(r"[.!?;:,]")
 _SINGLE_TOKEN_RE = re.compile(r"^\S+$")
 
 
@@ -44,11 +45,19 @@ def _heuristic_classify(text: str) -> str | None:
     if stripped.isdigit():
         return "skip"
 
-    # Trailing number on a short string (e.g. "Chapter 3", "Section 1.2")
-    # Requires a non-digit character before the digits to avoid overlap with
-    # the pure-digit check above.  Strings like "12" never reach this branch.
-    if len(stripped) <= 30 and _TRAILING_NUM_RE.search(stripped):
-        return "skip"
+    # Trailing number on a short string — only skip if the non-numeric prefix
+    # is a single short word (< 15 chars, 1 word) AND the string does not end
+    # with sentence punctuation.  This catches headings like "Chapter 3",
+    # "Section 1.2", "Room 12" but NOT sentences like "She was born in 1990"
+    # or "He turned 40".
+    if len(stripped) <= 30:
+        m = _TRAILING_NUM_RE.search(stripped)
+        if m:
+            prefix = stripped[:m.start()].rstrip()
+            prefix_words = prefix.split()
+            ends_with_punct = stripped[-1] in ".!?;:,"
+            if len(prefix_words) <= 1 and len(prefix) < 15 and not ends_with_punct:
+                return "skip"
 
     # Single token, all uppercase — likely an abbreviation or label
     if _SINGLE_TOKEN_RE.match(stripped) and stripped.isupper() and len(stripped) <= 10:

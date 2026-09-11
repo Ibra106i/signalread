@@ -39,6 +39,7 @@ def detect_chapters(body_blocks: list[dict]) -> list[Chapter]:
     # Group consecutive blocks by key value
     chapters: list[Chapter] = []
     current_key = None
+    current_label = ""
     start_idx = 0
 
     for i, block in enumerate(body_blocks):
@@ -52,16 +53,13 @@ def detect_chapters(body_blocks: list[dict]) -> list[Chapter]:
 
         if key != current_key:
             if current_key is not None:
-                chapters.append(Chapter(id=label, block_start=start_idx, block_end=i))
+                chapters.append(Chapter(id=current_label, block_start=start_idx, block_end=i))
             current_key = key
+            current_label = label
             start_idx = i
 
     # Final chapter
     if current_key is not None:
-        if has_page:
-            label = f"page_{current_key}"
-        else:
-            label = f"section_{current_key}"
-        chapters.append(Chapter(id=label, block_start=start_idx, block_end=len(body_blocks)))
+        chapters.append(Chapter(id=current_label, block_start=start_idx, block_end=len(body_blocks)))
 
     return chapters
