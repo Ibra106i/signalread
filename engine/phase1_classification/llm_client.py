@@ -71,6 +71,11 @@ class LLMClient:
                 f"Cannot connect to {self.config.provider} at {self.config.base_url}. "
                 f"Is the service running? Details: {exc}"
             ) from exc
+        except httpx.TimeoutException as exc:
+            raise LLMClientError(
+                f"Request to {self.config.provider} timed out after "
+                f"{self.config.request_timeout}s. Details: {exc}"
+            ) from exc
         except httpx.HTTPStatusError as exc:
             raise LLMClientError(
                 f"HTTP error from {self.config.provider}: {exc.response.status_code}"

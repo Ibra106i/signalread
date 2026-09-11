@@ -21,6 +21,9 @@ out/
 .env.local
 .env.*.local
 
+# Config with real values (config.example.json stays tracked)
+config.json
+
 # IDE / OS
 .vscode/
 .idea/

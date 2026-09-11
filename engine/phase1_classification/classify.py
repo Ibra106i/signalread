@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Heuristic fast-path: classify very short ambiguous blocks without LLM
 # ---------------------------------------------------------------------------
-_TRAILING_NUM_RE = re.compile(r"\d+$")
+_TRAILING_NUM_RE = re.compile(r"[^\d]\d+$")
 _SINGLE_TOKEN_RE = re.compile(r"^\S+$")
 
 
@@ -44,9 +44,10 @@ def _heuristic_classify(text: str) -> str | None:
     if stripped.isdigit():
         return "skip"
 
-    # Trailing page number on a short string (e.g. "Chapter 3", "Section 1.2")
-    if len(stripped) <= 30 and _TRAILING_NUM_RE.match(stripped):
-        # Could be a section heading — skip it
+    # Trailing number on a short string (e.g. "Chapter 3", "Section 1.2")
+    # Requires a non-digit character before the digits to avoid overlap with
+    # the pure-digit check above.  Strings like "12" never reach this branch.
+    if len(stripped) <= 30 and _TRAILING_NUM_RE.search(stripped):
         return "skip"
 
     # Single token, all uppercase — likely an abbreviation or label
@@ -97,13 +98,34 @@ def classify_blocks(
     data: dict,
     client: LLMClient,
     config: ClassifierConfig,
+    audit_log_path: Path | None = None,
 ) -> dict:
     """Classify all ambiguous blocks in a Phase 0 result dict.
 
     Returns a new dict with an added 'resolution' field per block.
+    If audit_log_path is provided, writes one line per resolved ambiguous block.
     """
     result = copy.deepcopy(data)
     blocks = result["blocks"]
+
+    # Open audit log early so failures still get written
+    audit_fh = None
+    if audit_log_path is not None:
+        audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_fh = open(audit_log_path, "w", encoding="utf-8")
+
+    def _audit(idx: int, block: dict) -> None:
+        """Write one audit line for an ambiguous block that was resolved."""
+        if audit_fh is None:
+            return
+        src = block.get("classification_source", "unknown")
+        res = block.get("resolution", "unknown")
+        text_preview = block["text"].replace("\n", " ")[:80]
+        audit_fh.write(
+            f"block={idx}  category=ambiguous  resolution={res}  "
+            f"source={src}  text={text_preview}\n"
+        )
+        audit_fh.flush()
 
     if not blocks:
         return result
@@ -151,6 +173,7 @@ def classify_blocks(
             block["resolution"] = heur_result
             block["classification_source"] = "heuristic"
             logger.debug("  Heuristic -> %s: %r", heur_result, text[:60])
+            _audit(idx, block)
             continue
 
         # Build context window (up to 2 blocks before/after)
@@ -179,6 +202,7 @@ def classify_blocks(
                     block["classification_source"] = "llm"
                     logger.debug("  LLM -> %s (attempt %d): %r", parsed, attempt + 1, text[:60])
                     resolved = True
+                    _audit(idx, block)
                     break
                 else:
                     # Malformed response — retry with stricter prompt
@@ -197,18 +221,21 @@ def classify_blocks(
                 block["resolution"] = "skip"
                 block["classification_source"] = "error_rate_limit"
                 resolved = True
+                _audit(idx, block)
                 break
             except LLMClientError as exc:
                 logger.error("LLM error: %s", exc)
                 block["resolution"] = "skip"
                 block["classification_source"] = "error"
                 resolved = True
+                _audit(idx, block)
                 break
 
         if not resolved:
             logger.warning("  Defaulting to SKIP after retries: %r", text[:60])
             block["resolution"] = "skip"
             block["classification_source"] = "default_skip"
+            _audit(idx, block)
 
     # --- Step 4: Sanity check — re-classify 5% sample of confident body blocks ---
     body_indices = [
@@ -262,6 +289,9 @@ def classify_blocks(
         if rate < 80:
             print("  WARNING: Low agreement rate — review classification quality.")
         print()
+
+    if audit_fh is not None:
+        audit_fh.close()
 
     return result
 
@@ -362,17 +392,19 @@ def main() -> None:
     print(f"Model:    {config.model}")
     print(f"Input:    {args.input_json.name}")
 
+    output_path = args.output or args.input_json.with_name(
+        f"{args.input_json.stem}_classified.json"
+    )
+    audit_log_path = output_path.with_name(f"{output_path.stem}_audit.log")
+
     try:
         with LLMClient(config) as client:
-            result = classify_blocks(data, client, config)
+            result = classify_blocks(data, client, config, audit_log_path=audit_log_path)
     except LLMClientError as exc:
         logger.error("Fatal LLM error: %s", exc)
         sys.exit(1)
 
     # --- Write output ---
-    output_path = args.output or args.input_json.with_name(
-        f"{args.input_json.stem}_classified.json"
-    )
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2, ensure_ascii=False)
 
