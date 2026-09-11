@@ -1,0 +1,6 @@
+{
+  "provider": "local",
+  "model": "qwen2.5:1.5b",
+  "api_key": "",
+  "base_url": "http://localhost:11434/v1"
+}
