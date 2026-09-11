@@ -30,12 +30,16 @@ def run_job(job: Job) -> None:
 
 def _run_pipeline(job: Job) -> None:
     work_dir = job.work_dir
-    input_file = work_dir / job.filename
-    ext = input_file.suffix.lower()
+    # The file was saved as input{ext} by the upload handler
+    ext = next((e for e in (".pdf", ".epub") if (work_dir / f"input{e}").exists()), None)
+    if ext is None:
+        update_job(job.id, stage=JobStage.FAILED, error="No input file found in job directory")
+        return
+    input_file = work_dir / f"input{ext}"
 
     # --- Phase 0: Extraction ---
     update_job(job.id, stage=JobStage.EXTRACTING, progress=0.0)
-    logger.info("Job %s: Phase 0 extracting %s", job.id, job.filename)
+    logger.info("Job %s: Phase 0 extracting %s", job.id, job.original_filename)
 
     try:
         if ext == ".pdf":

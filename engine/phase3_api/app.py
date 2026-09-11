@@ -40,7 +40,8 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     job = create_job(file.filename or f"upload{ext}", WORK_BASE)
-    dest = job.work_dir / job.filename
+    # Never use client-supplied filename for path — only the validated extension
+    dest = job.work_dir / f"input{ext}"
 
     # Save uploaded file to job's working directory
     content = await file.read()
@@ -51,7 +52,7 @@ async def upload_file(file: UploadFile = File(...)):
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, run_job, job)
 
-    return {"job_id": job.id, "filename": job.filename, "status": job.stage.value}
+    return {"job_id": job.id, "filename": job.original_filename, "status": job.stage.value}
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +67,7 @@ async def get_status(job_id: str):
 
     result = {
         "job_id": job.id,
-        "filename": job.filename,
+        "filename": job.original_filename,
         "stage": job.stage.value,
         "progress": job.progress,
     }
@@ -92,6 +93,12 @@ async def get_manifest(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    if job.stage == JobStage.FAILED:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Job failed", "error": job.error},
+        )
+
     if job.stage not in (JobStage.DONE,):
         raise HTTPException(
             status_code=202,
@@ -114,6 +121,12 @@ async def get_audio(job_id: str, chapter_id: str, request: Request):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    if job.stage == JobStage.FAILED:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Job failed", "error": job.error},
+        )
+
     if job.stage != JobStage.DONE:
         raise HTTPException(
             status_code=202,
@@ -129,11 +142,17 @@ async def get_audio(job_id: str, chapter_id: str, request: Request):
     # Parse Range header
     range_header = request.headers.get("range")
     if range_header:
-        # Parse "bytes=start-end"
+        # Parse "bytes=start-end" or "bytes=-suffix"
         try:
-            ranges = range_header.replace("bytes=", "").split("-")
-            start = int(ranges[0]) if ranges[0] else 0
-            end = int(ranges[1]) if ranges[1] else file_size - 1
+            ranges = range_header.replace("bytes=", "").split("-", 1)
+            if ranges[0] == "":
+                # Suffix range: bytes=-500 means last 500 bytes
+                suffix_length = int(ranges[1])
+                start = max(0, file_size - suffix_length)
+                end = file_size - 1
+            else:
+                start = int(ranges[0]) if ranges[0] else 0
+                end = int(ranges[1]) if ranges[1] else file_size - 1
         except (ValueError, IndexError):
             raise HTTPException(status_code=416, detail="Invalid Range header")
 
@@ -194,6 +213,12 @@ async def get_audit_log(job_id: str):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.stage == JobStage.FAILED:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Job failed", "error": job.error},
+        )
 
     if job.stage.value not in ("classifying", "synthesizing", "done", "failed"):
         if job.audit_log is None:

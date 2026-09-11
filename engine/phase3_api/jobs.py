@@ -22,7 +22,8 @@ class JobStage(str, Enum):
 @dataclass
 class Job:
     id: str
-    filename: str
+    original_filename: str
+    work_dir: Path = field(default_factory=Path)
     stage: JobStage = JobStage.EXTRACTING
     progress: float = 0.0
     error: str | None = None
@@ -39,12 +40,12 @@ class Job:
 _jobs: dict[str, Job] = {}
 
 
-def create_job(filename: str, work_base: Path) -> Job:
+def create_job(original_filename: str, work_base: Path) -> Job:
     """Create a new job with a unique ID and isolated working directory."""
     job_id = uuid.uuid4().hex[:12]
     work_dir = work_base / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
-    job = Job(id=job_id, filename=filename, work_dir=work_dir)
+    job = Job(id=job_id, original_filename=original_filename, work_dir=work_dir)
     _jobs[job_id] = job
     return job
 
